@@ -1,0 +1,1 @@
+# Diagnosis pipeline stage placeholder.

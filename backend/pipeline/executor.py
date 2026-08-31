@@ -1,0 +1,1 @@
+# Execution pipeline stage placeholder.

@@ -1,0 +1,1 @@
+# Backend cache integration placeholder.
