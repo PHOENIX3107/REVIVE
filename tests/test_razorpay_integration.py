@@ -15,6 +15,10 @@ from backend.integrations.razorpay.signature import (
     RazorpayWebhookSignatureError,
     verify_webhook_signature,
 )
+from backend.recovery.reconciliation import (
+    normalize_order_response,
+    normalize_payment_response,
+)
 
 
 def test_verify_webhook_signature_uses_exact_raw_body() -> None:
@@ -115,3 +119,66 @@ def test_client_config_rejects_non_test_mode_key(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="Test Mode"):
         RazorpayClientConfig.from_env()
+
+
+def test_normalize_direct_api_payment_and_order_responses() -> None:
+    payment = normalize_payment_response(
+        {
+            "id": "pay_123",
+            "entity": "payment",
+            "amount": 49900,
+            "currency": "INR",
+            "status": "captured",
+            "method": "card",
+            "order_id": "order_123",
+            "captured": True,
+            "amount_captured": 49900,
+            "created_at": 1767225600,
+            "card": {"iin": "411111"},
+        }
+    )
+    order = normalize_order_response(
+        {
+            "id": "order_123",
+            "entity": "order",
+            "amount": 49900,
+            "amount_paid": 49900,
+            "amount_due": 0,
+            "currency": "INR",
+            "status": "paid",
+            "attempts": 1,
+            "created_at": 1767225600,
+        }
+    )
+
+    assert payment.provider_status == "captured"
+    assert payment.payment.payment_id == "pay_123"
+    assert payment.payment.order_id == "order_123"
+    assert payment.payment.status.value == "captured"
+    assert payment.amount_captured == 49900
+    assert order.provider_status == "paid"
+    assert order.order.order_id == "order_123"
+    assert order.order.status.value == "paid"
+
+
+@pytest.mark.parametrize("provider_status", ["created", "refunded"])
+def test_normalize_created_and_refunded_keeps_provider_state_without_internal_coercion(
+    provider_status: str,
+) -> None:
+    payment = normalize_payment_response(
+        {
+            "id": "pay_123",
+            "entity": "payment",
+            "amount": 49900,
+            "currency": "INR",
+            "status": provider_status,
+            "method": "card",
+            "order_id": "order_123",
+            "captured": False,
+            "amount_captured": 0,
+            "created_at": 1767225600,
+        }
+    )
+
+    assert payment.provider_status == provider_status
+    assert payment.payment is None

@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from backend.db import Database
 from backend.integrations.razorpay.client import (
     RazorpayCheckoutOptions,
+    RazorpayAPIError,
     RazorpayClientConfig,
     build_checkout_options,
 )
@@ -21,6 +22,13 @@ from backend.recovery.case_processor import (
     RecoveryCaseProcessor,
     RecoveryCaseProcessingResult,
     RecoveryCaseStateError,
+)
+from backend.recovery.reconciliation import (
+    PaymentVerificationCaseNotFoundError,
+    PaymentVerificationError,
+    PaymentVerificationResult,
+    PaymentVerificationStateError,
+    RazorpayPaymentReconciler,
 )
 from backend.policies.recovery_policy import PolicyDecisionType
 from backend.schemas import Order, OrderStatus, PaymentAttempt, PaymentStatus
@@ -56,10 +64,12 @@ class CustomerCheckoutResponse(BaseModel):
 def create_app(
     database: Database | None = None,
     recovery_processor: RecoveryCaseProcessor | None = None,
+    payment_reconciler: RazorpayPaymentReconciler | None = None,
 ) -> FastAPI:
     app = FastAPI(title="REVIVE", version="0.1.0")
     app.state.database = database
     app.state.recovery_processor = recovery_processor
+    app.state.payment_reconciler = payment_reconciler
 
     @app.on_event("startup")
     def _initialize_schema() -> None:
@@ -174,6 +184,36 @@ def create_app(
         )
 
     @app.post(
+        "/recovery-cases/{case_id}/verify-payment",
+        response_model=PaymentVerificationResult,
+    )
+    def verify_recovery_payment(
+        case_id: str,
+        reconciler: RazorpayPaymentReconciler = Depends(get_payment_reconciler),
+    ) -> PaymentVerificationResult:
+        try:
+            return reconciler.verify_case(case_id)
+        except PaymentVerificationCaseNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except PaymentVerificationStateError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except PaymentVerificationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Razorpay payment verification returned invalid data.",
+            ) from exc
+        except RazorpayAPIError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Razorpay payment verification failed.",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Razorpay Test Mode credentials are not configured.",
+            ) from exc
+
+    @app.post(
         "/recovery-cases/{case_id}/process",
         response_model=RecoveryCaseProcessingResult,
     )
@@ -244,6 +284,16 @@ def get_recovery_case_processor(request: Request) -> RecoveryCaseProcessor:
             detail="Recovery case processor is not configured.",
         )
     return processor
+
+
+def get_payment_reconciler(
+    request: Request,
+    database: Database = Depends(get_database),
+) -> RazorpayPaymentReconciler:
+    reconciler = getattr(request.app.state, "payment_reconciler", None)
+    if reconciler is not None:
+        return reconciler
+    return RazorpayPaymentReconciler(database)
 
 
 app = create_app()

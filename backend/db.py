@@ -418,14 +418,218 @@ class Database:
         observed_at: datetime | None = None,
     ) -> None:
         with self.transaction() as connection:
-            connection.execute(
-                """
-                INSERT INTO payment_outcomes (payment_id, status, amount_recovered, observed_at)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (payment_id) DO UPDATE SET
-                    status = EXCLUDED.status,
-                    amount_recovered = EXCLUDED.amount_recovered,
-                    observed_at = EXCLUDED.observed_at
-                """,
-                (payment_id, status, amount_recovered, observed_at or datetime.now(timezone.utc)),
+            self._save_payment_outcome(
+                connection,
+                payment_id,
+                status,
+                amount_recovered,
+                observed_at,
             )
+
+    def _save_payment_outcome(
+        self,
+        connection: psycopg.Connection[Any],
+        payment_id: str,
+        status: str,
+        amount_recovered: int,
+        observed_at: datetime | None = None,
+        *,
+        provider_confirmed: bool = False,
+    ) -> None:
+        if status == "recovered" and not provider_confirmed:
+            raise ValueError("Recovered payment outcomes require provider confirmation.")
+        connection.execute(
+            """
+            INSERT INTO payment_outcomes (payment_id, status, amount_recovered, observed_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (payment_id) DO UPDATE SET
+                status = EXCLUDED.status,
+                amount_recovered = EXCLUDED.amount_recovered,
+                observed_at = EXCLUDED.observed_at
+            """,
+            (payment_id, status, amount_recovered, observed_at or datetime.now(timezone.utc)),
+        )
+
+    def _save_provider_recovered_outcome(
+        self,
+        connection: psycopg.Connection[Any],
+        payment_id: str,
+        amount_recovered: int,
+        observed_at: datetime | None = None,
+    ) -> None:
+        """Record recovery only after the local payment is provider-confirmed."""
+        row = connection.execute(
+            """
+            SELECT p.status AS payment_status, p.amount AS payment_amount,
+                   o.status AS order_status, o.amount AS order_amount
+            FROM payment_attempts AS p
+            JOIN orders AS o ON o.order_id = p.order_id
+            WHERE p.payment_id = %s
+            FOR UPDATE OF p, o
+            """,
+            (payment_id,),
+        ).fetchone()
+        if (
+            not row
+            or row["payment_status"] != PaymentStatus.captured.value
+            or row["order_status"] != "paid"
+            or row["payment_amount"] != amount_recovered
+            or row["order_amount"] != amount_recovered
+        ):
+            raise ValueError("Recovered payment outcome requires a captured payment and paid order.")
+        self._save_payment_outcome(
+            connection,
+            payment_id,
+            "recovered",
+            amount_recovered,
+            observed_at,
+            provider_confirmed=True,
+        )
+
+    def reconcile_provider_state(
+        self,
+        case_id: str,
+        payment: PaymentAttempt,
+        order: Order,
+        *,
+        provider_payment_status: str,
+        provider_order_status: str,
+        recovery_confirmed: bool,
+        recovered_amount: int,
+        observed_at: datetime,
+        audit_reason: str,
+    ) -> dict[str, Any]:
+        """Atomically apply one provider verification to a recovery case.
+
+        Payment and order writes use the existing monotonic upserts. The case
+        row is locked to make the deterministic reconciliation audit record
+        idempotent when verification requests race.
+        """
+        with self.transaction() as connection:
+            case = connection.execute(
+                """
+                SELECT case_id, payment_id, order_id, status
+                FROM recovery_cases
+                WHERE case_id = %s
+                FOR UPDATE
+                """,
+                (case_id,),
+            ).fetchone()
+            if not case:
+                raise ValueError(f"Recovery case not found: {case_id}")
+            if case["payment_id"] != payment.payment_id or case["order_id"] != order.order_id:
+                raise ValueError("Provider reconciliation identities do not match the recovery case.")
+
+            current_payment = connection.execute(
+                "SELECT status FROM payment_attempts WHERE payment_id = %s FOR UPDATE",
+                (payment.payment_id,),
+            ).fetchone()
+            current_order = connection.execute(
+                "SELECT status FROM orders WHERE order_id = %s FOR UPDATE",
+                (order.order_id,),
+            ).fetchone()
+            if not current_payment or not current_order:
+                raise ValueError("Provider reconciliation state is missing its payment or order.")
+
+            payment_status_before = current_payment["status"]
+            order_status_before = current_order["status"]
+            case_status_before = case["status"]
+
+            self._save_order(connection, order)
+            self._save_payment_attempt(connection, payment)
+
+            outcome_changed = False
+            if recovery_confirmed:
+                outcome = connection.execute(
+                    """
+                    SELECT status, amount_recovered
+                    FROM payment_outcomes
+                    WHERE payment_id = %s
+                    FOR UPDATE
+                    """,
+                    (payment.payment_id,),
+                ).fetchone()
+                outcome_changed = (
+                    outcome is None
+                    or outcome["status"] != "recovered"
+                    or outcome["amount_recovered"] != recovered_amount
+                )
+                self._save_provider_recovered_outcome(
+                    connection,
+                    payment.payment_id,
+                    recovered_amount,
+                    observed_at,
+                )
+                if case_status_before != "recovered":
+                    connection.execute(
+                        """
+                        UPDATE recovery_cases
+                        SET status = 'recovered', updated_at = now()
+                        WHERE case_id = %s
+                        """,
+                        (case_id,),
+                    )
+
+            audit_status = "confirmed" if recovery_confirmed else "observed"
+            audit_action = "provider_reconciliation"
+            existing_audit = connection.execute(
+                """
+                SELECT audit_id
+                FROM audit_events
+                WHERE case_id = %s AND action = %s AND status = %s AND reason = %s
+                LIMIT 1
+                """,
+                (case_id, audit_action, audit_status, audit_reason),
+            ).fetchone()
+            reconciliation_recorded = existing_audit is None
+            if reconciliation_recorded:
+                connection.execute(
+                    """
+                    INSERT INTO audit_events
+                        (case_id, payment_id, order_id, policy_decision, action, status, reason, timestamp)
+                    VALUES (%s, %s, %s, 'reconciliation', %s, %s, %s, %s)
+                    """,
+                    (
+                        case_id,
+                        payment.payment_id,
+                        order.order_id,
+                        audit_action,
+                        audit_status,
+                        audit_reason,
+                        observed_at,
+                    ),
+                )
+
+            payment_after = connection.execute(
+                "SELECT status FROM payment_attempts WHERE payment_id = %s",
+                (payment.payment_id,),
+            ).fetchone()
+            order_after = connection.execute(
+                "SELECT status FROM orders WHERE order_id = %s",
+                (order.order_id,),
+            ).fetchone()
+            case_after = connection.execute(
+                "SELECT status FROM recovery_cases WHERE case_id = %s",
+                (case_id,),
+            ).fetchone()
+            if not payment_after or not order_after or not case_after:
+                raise ValueError("Provider reconciliation did not leave complete local state.")
+
+            return {
+                "case_id": case_id,
+                "payment_id": payment.payment_id,
+                "order_id": order.order_id,
+                "provider_payment_status": provider_payment_status,
+                "provider_order_status": provider_order_status,
+                "revive_payment_status": payment_after["status"],
+                "order_status": order_after["status"],
+                "state_changed": (
+                    payment_status_before != payment_after["status"]
+                    or order_status_before != order_after["status"]
+                    or case_status_before != case_after["status"]
+                    or outcome_changed
+                ),
+                "recovery_confirmed": recovery_confirmed,
+                "recovered_amount": recovered_amount if recovery_confirmed else 0,
+                "reconciliation_recorded": reconciliation_recorded,
+            }

@@ -79,6 +79,7 @@ def _webhook_payload(
                     "currency": currency,
                     "status": status,
                     "captured": status == "captured",
+                    "amount_captured": amount if status == "captured" else 0,
                     "method": method,
                     "created_at": NOW_TS,
                     "card": {"iin": "411111"},
@@ -328,6 +329,7 @@ def test_failed_then_captured_supersedes_failed_state(client, database):
     assert payment is not None and payment.status is PaymentStatus.captured
     assert order is not None and order.status is OrderStatus.paid
     assert recovery_case is not None and recovery_case["status"] == "recovered"
+    assert _count_rows(database, "payment_outcomes") == 1
 
 
 def test_captured_then_failed_does_not_regress_captured_state(client, database):
@@ -372,8 +374,11 @@ def test_failed_then_order_paid_does_not_regress_order(client, database):
 
     payment = database.get_payment_attempt("pay_api_1")
     order = database.get_order("order_api_1")
+    recovery_case = database.get_recovery_case("recovery-pay_api_1")
     assert payment is not None and payment.status is PaymentStatus.failed
     assert order is not None and order.status is OrderStatus.paid
+    assert recovery_case is not None and recovery_case["status"] == "open"
+    assert _count_rows(database, "payment_outcomes") == 0
 
 
 def test_duplicate_captured_webhook_is_idempotent(client, database):
@@ -464,6 +469,143 @@ def test_captured_after_failed_updates_existing_case_without_duplicate(client, d
     assert _count_rows(database, "recovery_cases") == 1
     recovery_case = database.get_recovery_case("recovery-pay_api_1")
     assert recovery_case is not None and recovery_case["status"] == "recovered"
+
+
+def _seed_failed_payment_case(database, payment_id, order_id="order_multi"):
+    database.save_payment_attempt(
+        PaymentAttempt(
+            payment_id=payment_id,
+            order_id=order_id,
+            amount=49900,
+            method=PaymentMethod.card,
+            status=PaymentStatus.failed,
+            captured=False,
+            created_at=NOW,
+            error=PaymentError(code="insufficient_funds"),
+            issuer_bin="411111",
+            failed_at=NOW,
+        )
+    )
+    database.save_recovery_case(f"case-{payment_id}", payment_id, order_id, "open")
+
+
+def test_payment_captured_recovers_only_that_payment_case(client, database):
+    database.save_order(
+        Order(
+            order_id="order_multi",
+            amount=49900,
+            amount_paid=0,
+            amount_due=49900,
+            currency="INR",
+            status=OrderStatus.attempted,
+            attempts=3,
+            created_at=NOW,
+        )
+    )
+    for payment_id in ("pay_multi_1", "pay_multi_2", "pay_multi_3"):
+        _seed_failed_payment_case(database, payment_id)
+
+    event_id, body = _webhook_payload(
+        event_id="evt_multi_payment_captured",
+        event_type="payment.captured",
+        payment_id="pay_multi_3",
+        order_id="order_multi",
+        status="captured",
+    )
+    response = client.post(
+        "/webhooks/razorpay",
+        content=body,
+        headers=_webhook_headers(event_id, body),
+    )
+
+    assert response.status_code == 200
+    assert database.get_recovery_case("case-pay_multi_1")["status"] == "open"
+    assert database.get_recovery_case("case-pay_multi_2")["status"] == "open"
+    assert database.get_recovery_case("case-pay_multi_3")["status"] == "recovered"
+    assert database.get_payment_attempt("pay_multi_1").status is PaymentStatus.failed
+    assert database.get_payment_attempt("pay_multi_2").status is PaymentStatus.failed
+    assert database.get_payment_attempt("pay_multi_3").status is PaymentStatus.captured
+    with database.connection() as connection:
+        outcomes = connection.execute(
+            "SELECT payment_id, amount_recovered FROM payment_outcomes ORDER BY payment_id"
+        ).fetchall()
+    assert outcomes == [{"payment_id": "pay_multi_3", "amount_recovered": 49900}]
+
+
+def test_order_paid_does_not_recover_failed_cases_for_other_payment(client, database):
+    database.save_order(
+        Order(
+            order_id="order_multi",
+            amount=49900,
+            amount_paid=0,
+            amount_due=49900,
+            currency="INR",
+            status=OrderStatus.attempted,
+            attempts=3,
+            created_at=NOW,
+        )
+    )
+    for payment_id in ("pay_multi_1", "pay_multi_2"):
+        _seed_failed_payment_case(database, payment_id)
+
+    captured_id, captured_body = _webhook_payload(
+        event_id="evt_multi_success",
+        event_type="payment.captured",
+        payment_id="pay_multi_3",
+        order_id="order_multi",
+        status="captured",
+    )
+    assert client.post(
+        "/webhooks/razorpay",
+        content=captured_body,
+        headers=_webhook_headers(captured_id, captured_body),
+    ).status_code == 200
+
+    paid_id, paid_body = _order_paid_payload(
+        event_id="evt_multi_order_paid",
+        order_id="order_multi",
+    )
+    assert client.post(
+        "/webhooks/razorpay",
+        content=paid_body,
+        headers=_webhook_headers(paid_id, paid_body),
+    ).status_code == 200
+
+    assert database.get_recovery_case("case-pay_multi_1")["status"] == "open"
+    assert database.get_recovery_case("case-pay_multi_2")["status"] == "open"
+    with database.connection() as connection:
+        outcomes = connection.execute(
+            "SELECT payment_id, amount_recovered FROM payment_outcomes ORDER BY payment_id"
+        ).fetchall()
+    assert outcomes == [{"payment_id": "pay_multi_3", "amount_recovered": 49900}]
+
+
+@pytest.mark.parametrize("field, value", [("amount", 49800), ("currency", "USD")])
+def test_captured_webhook_monetary_mismatch_creates_no_outcome(client, database, field, value):
+    failed_id, failed_body = _webhook_payload(event_id=f"evt_mismatch_failed_{field}")
+    assert client.post(
+        "/webhooks/razorpay",
+        content=failed_body,
+        headers=_webhook_headers(failed_id, failed_body),
+    ).status_code == 200
+
+    payload_kwargs = {field: value}
+    captured_id, captured_body = _webhook_payload(
+        event_id=f"evt_mismatch_captured_{field}",
+        event_type="payment.captured",
+        status="captured",
+        **payload_kwargs,
+    )
+    response = client.post(
+        "/webhooks/razorpay",
+        content=captured_body,
+        headers=_webhook_headers(captured_id, captured_body),
+    )
+
+    assert response.status_code == 400
+    assert database.get_payment_attempt("pay_api_1").status is PaymentStatus.failed
+    assert database.get_recovery_case("recovery-pay_api_1")["status"] == "open"
+    assert _count_rows(database, "payment_outcomes") == 0
 
 
 def test_failed_webhook_case_write_rolls_back_without_orphan_case(database, webhook_secret):

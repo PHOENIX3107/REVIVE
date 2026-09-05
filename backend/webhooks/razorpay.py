@@ -15,6 +15,10 @@ class RazorpayWebhookParseError(ValueError):
     """Raised when a webhook body cannot be parsed safely."""
 
 
+class RazorpayWebhookStateError(RazorpayWebhookParseError):
+    """Raised when provider data conflicts with persisted monetary state."""
+
+
 class RazorpayWebhookEvent(BaseModel):
     event_id: str
     event_type: str
@@ -25,6 +29,7 @@ class RazorpayWebhookEvent(BaseModel):
 class RazorpayPaymentState(BaseModel):
     attempt: PaymentAttempt
     currency: str
+    amount_captured: int | None = None
 
 
 class WebhookIngestResult(BaseModel):
@@ -269,7 +274,18 @@ class RazorpayWebhookAdapter:
             issuer_bin=_issuer_bin(entity),
             failed_at=failed_at,
         )
-        return RazorpayPaymentState(attempt=attempt, currency=currency)
+        raw_amount_captured = entity.get("amount_captured")
+        amount_captured = _coerce_int(raw_amount_captured)
+        if (
+            raw_amount_captured is not None
+            and (amount_captured is None or amount_captured < 0)
+        ):
+            return None
+        return RazorpayPaymentState(
+            attempt=attempt,
+            currency=currency,
+            amount_captured=amount_captured,
+        )
 
     def placeholder_order_from_payment(self, payment_state: RazorpayPaymentState) -> Order:
         attempt = payment_state.attempt
@@ -360,13 +376,15 @@ class RazorpayWebhookProcessor:
 
     def _apply_event(self, connection: Any, event: RazorpayWebhookEvent) -> None:
         order_snapshot = self.adapter.extract_order_snapshot(event)
-        payment_state = self.adapter.extract_payment_state(
-            event,
-            order_id_override=order_snapshot.order_id if order_snapshot is not None else None,
-        )
+        # A payment event must carry its own provider order_id. Never infer or
+        # replace that identity from a separate order entity before validating
+        # the exact payment attribution.
+        payment_state = self.adapter.extract_payment_state(event)
 
         if payment_state is not None:
             base_order = order_snapshot or self.adapter.placeholder_order_from_payment(payment_state)
+            self._validate_order_snapshot(connection, base_order)
+            self._validate_payment_state(connection, payment_state, base_order)
             self.database._save_order(connection, base_order)
             self._persist_payment_state(connection, payment_state)
             attempt_count = self.database.count_payment_attempts_for_order(connection, payment_state.attempt.order_id)
@@ -375,13 +393,57 @@ class RazorpayWebhookProcessor:
             if payment_state.attempt.status is PaymentStatus.failed:
                 self._create_recovery_case_if_eligible(connection, payment_state, base_order)
             elif payment_state.attempt.status is PaymentStatus.captured:
-                self._mark_recovery_cases_recovered(connection, payment_state.attempt.order_id)
+                self.database._save_provider_recovered_outcome(
+                    connection,
+                    payment_state.attempt.payment_id,
+                    payment_state.attempt.amount,
+                    event.occurred_at,
+                )
+                self._mark_recovery_case_recovered(
+                    connection,
+                    payment_state.attempt.payment_id,
+                    payment_state.attempt.order_id,
+                )
             return
 
         if order_snapshot is not None:
+            self._validate_order_snapshot(connection, order_snapshot)
             self._persist_order_state(connection, order_snapshot)
-            if event.event_type == "order.paid":
-                self._mark_recovery_cases_recovered(connection, order_snapshot.order_id)
+
+    def _validate_order_snapshot(self, connection: Any, incoming: Order) -> None:
+        if incoming.amount_paid < 0 or incoming.amount_paid > incoming.amount:
+            raise RazorpayWebhookStateError("Razorpay order amount_paid is invalid.")
+        if incoming.status is OrderStatus.paid and incoming.amount_paid != incoming.amount:
+            raise RazorpayWebhookStateError("Razorpay paid order amount does not match its order amount.")
+        row = connection.execute(
+            "SELECT amount, currency FROM orders WHERE order_id = %s",
+            (incoming.order_id,),
+        ).fetchone()
+        if row and (row["amount"] != incoming.amount or row["currency"] != incoming.currency):
+            raise RazorpayWebhookStateError("Razorpay order does not match persisted state.")
+
+    def _validate_payment_state(
+        self,
+        connection: Any,
+        payment_state: RazorpayPaymentState,
+        incoming_order: Order,
+    ) -> None:
+        payment = payment_state.attempt
+        if payment.order_id != incoming_order.order_id or payment.amount != incoming_order.amount:
+            raise RazorpayWebhookStateError("Razorpay payment does not match its order.")
+        if payment_state.currency != incoming_order.currency:
+            raise RazorpayWebhookStateError("Razorpay payment currency does not match its order.")
+        if payment.status is PaymentStatus.captured:
+            captured_amount = payment_state.amount_captured
+            if captured_amount is not None and captured_amount != payment.amount:
+                raise RazorpayWebhookStateError("Razorpay captured amount does not match the payment amount.")
+
+        row = connection.execute(
+            "SELECT order_id, amount FROM payment_attempts WHERE payment_id = %s",
+            (payment.payment_id,),
+        ).fetchone()
+        if row and (row["order_id"] != payment.order_id or row["amount"] != payment.amount):
+            raise RazorpayWebhookStateError("Razorpay payment does not match persisted state.")
 
     def _persist_payment_state(self, connection: Any, payment_state: RazorpayPaymentState) -> None:
         self.database._save_payment_attempt(connection, payment_state.attempt)
@@ -413,12 +475,21 @@ class RazorpayWebhookProcessor:
             status="open",
         )
 
-    def _mark_recovery_cases_recovered(self, connection: Any, order_id: str) -> None:
-        rows = connection.execute(
-            "SELECT case_id, payment_id, order_id FROM recovery_cases WHERE order_id = %s",
-            (order_id,),
-        ).fetchall()
-        for row in rows:
+    def _mark_recovery_case_recovered(
+        self,
+        connection: Any,
+        payment_id: str,
+        order_id: str,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT case_id, payment_id, order_id
+            FROM recovery_cases
+            WHERE payment_id = %s AND order_id = %s
+            """,
+            (payment_id, order_id),
+        ).fetchone()
+        if row:
             self._persist_recovery_case(
                 connection,
                 case_id=row["case_id"],
