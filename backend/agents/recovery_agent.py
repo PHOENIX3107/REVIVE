@@ -65,3 +65,44 @@ class RecoveryAgent:
             "recovery. Evidence: "
             f"{evidence_json}"
         )
+
+
+def local_diagnosis_provider(prompt: str) -> dict[str, Any]:
+    """Return a conservative deterministic diagnosis without an external model.
+
+    ``RecoveryAgent`` remains the provider boundary.  This local provider is the
+    default application composition for development and deliberately classifies
+    insufficient or malformed evidence as unknown, which keeps the policy in
+    control of whether recovery is allowed.
+    """
+    try:
+        evidence = json.loads(prompt.split("Evidence: ", 1)[1])
+        signal = evidence["signal"]
+        downtime = evidence["downtime"]
+        error_code = (evidence["payment"].get("error") or {}).get("code")
+    except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+        return {
+            "category": DiagnosisCategory.unknown.value,
+            "confidence": 0.0,
+            "reason": "The supplied evidence is insufficient for classification.",
+        }
+
+    if signal.get("is_cluster_candidate") or downtime.get("matched"):
+        return {
+            "category": DiagnosisCategory.systemic_issue.value,
+            "confidence": 1.0,
+            "reason": "Evidence contains a population signal or matching downtime.",
+        }
+
+    if error_code in {"insufficient_funds", "expired_card", "cvv_mismatch"}:
+        return {
+            "category": DiagnosisCategory.customer_issue.value,
+            "confidence": 1.0,
+            "reason": "Evidence contains a customer-side card failure without systemic evidence.",
+        }
+
+    return {
+        "category": DiagnosisCategory.unknown.value,
+        "confidence": 0.0,
+        "reason": "The supplied evidence is insufficient for classification.",
+    }

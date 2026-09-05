@@ -4,7 +4,8 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
-from backend.agents.recovery_agent import DiagnosisCategory, RecoveryAgent
+from backend import main as main_module
+from backend.agents.recovery_agent import DiagnosisCategory, RecoveryAgent, local_diagnosis_provider
 from backend.cache import RedisFailureCache, RedisIdempotencyCache
 from backend.db import Database
 from backend.main import create_app
@@ -115,6 +116,43 @@ def _processor(database, response, *, downtimes=()):
 def _count(database, table):
     with database.connection() as connection:
         return connection.execute(f"SELECT count(*) AS count FROM {table}").fetchone()["count"]
+
+
+def test_default_app_composition_builds_processor_without_injection(database, monkeypatch):
+    redis = FakeRedis()
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setattr(main_module.redis.Redis, "from_url", lambda *_args, **_kwargs: redis)
+
+    app = main_module.create_app()
+    with TestClient(app):
+        processor = app.state.recovery_processor
+
+    assert isinstance(processor, RecoveryCaseProcessor)
+    assert processor.database.database_url == DATABASE_URL
+    assert isinstance(processor.signal_detector, SignalDetector)
+    assert isinstance(processor.signal_detector.failure_cache, RedisFailureCache)
+    assert isinstance(processor.recovery_agent, RecoveryAgent)
+    assert processor.recovery_agent.provider is local_diagnosis_provider
+    assert isinstance(processor.recovery_executor, RecoveryExecutor)
+    assert processor.signal_detector.failure_cache.redis is redis
+    assert processor.recovery_executor.idempotency_cache.redis is redis
+    assert processor.downtimes == ()
+
+
+def test_default_app_processes_case_without_payment_outcome(database, monkeypatch):
+    _seed_case(database)
+    redis = FakeRedis()
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setattr(main_module.redis.Redis, "from_url", lambda *_args, **_kwargs: redis)
+
+    with TestClient(main_module.create_app()) as client:
+        response = client.post("/recovery-cases/case_process/process")
+
+    assert response.status_code == 200
+    assert response.json()["decision"]["decision"] == "recover"
+    assert response.json()["execution"]["executed"] is True
+    assert _count(database, "payment_outcomes") == 0
 
 
 def test_persisted_failed_payment_runs_diagnosis_and_decision(database):

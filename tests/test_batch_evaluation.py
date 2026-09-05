@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+from backend.evaluation.metrics import ProviderConfirmedOutcome
 from backend.evaluation.run_batch import format_report, run_batch
 from backend.generator import generate_batch
 from backend.schemas import PaymentStatus
@@ -27,8 +28,8 @@ def test_revenue_at_risk_comes_from_generated_batch():
 
 def test_recovery_rate_uses_eligible_revenue():
     result = run_batch()
-    expected = Decimal(result.recovered_revenue) / Decimal(result.eligible_revenue)
-    assert result.recovery_rate == expected
+    assert result.recovered_revenue == 0
+    assert result.recovery_rate == Decimal("0")
 
 
 def test_normal_batch_has_no_duplicates_or_unsafe_actions():
@@ -37,10 +38,31 @@ def test_normal_batch_has_no_duplicates_or_unsafe_actions():
     assert result.unsafe_action_count == 0
 
 
-def test_recovered_revenue_matches_successful_simulated_recoveries():
+def test_simulated_executions_are_separate_from_recovered_revenue():
     result = run_batch()
-    assert result.successful_recovery_count == result.recovery_action_count
-    assert result.recovered_revenue == result.eligible_revenue
+    assert result.simulated_execution_count == result.recovery_action_count
+    assert result.simulated_execution_count > 0
+    assert result.recovered_revenue == 0
+
+
+def test_batch_counts_only_explicit_provider_confirmed_outcomes():
+    batch = generate_batch(num_attempts=100, seed=42)
+    attempt = next(
+        item
+        for item in batch["payment_attempts"]
+        if item.status is PaymentStatus.failed
+        and item.error is not None
+        and item.error.code == "insufficient_funds"
+    )
+    outcome = ProviderConfirmedOutcome(
+        payment_id=attempt.payment_id,
+        status="captured",
+        amount_recovered=attempt.amount,
+    )
+
+    result = run_batch([outcome, outcome])
+
+    assert result.recovered_revenue == attempt.amount
 
 
 def test_systemic_cases_are_not_recovered():

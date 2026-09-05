@@ -1,5 +1,8 @@
+import pytest
+
 from backend.evaluation.metrics import (
     EvaluationRecord,
+    ProviderConfirmedOutcome,
     customer_side_recovery_attempts,
     number_of_blocked_actions,
     number_of_duplicate_actions_prevented,
@@ -14,26 +17,60 @@ from backend.policies.recovery_policy import PolicyDecisionType
 from backend.schemas import PaymentStatus
 
 
-def record(payment_id, amount, *, decision=PolicyDecisionType.recover, status="executed", success=False, **kwargs):
+def record(
+    payment_id,
+    amount,
+    *,
+    decision=PolicyDecisionType.recover,
+    status="executed",
+    execution_success=False,
+    **kwargs,
+):
     return EvaluationRecord(
         payment_id=payment_id,
         amount=amount,
         policy_decision=decision,
         execution_status=status,
-        recovery_succeeded=success,
+        execution_succeeded=execution_success,
         **kwargs,
     )
 
 
-def test_recovered_amount_requires_explicit_success():
-    records = [record("one", 49900, success=True), record("two", 19900, success=False)]
-    assert total_amount_recovered(records) == 49900
-    assert total_amount_at_risk(records) == 69800
+def outcome(payment_id, amount=49900, status="recovered"):
+    return ProviderConfirmedOutcome(
+        payment_id=payment_id,
+        status=status,
+        amount_recovered=amount,
+    )
+
+
+def test_simulated_execution_does_not_count_as_recovered_revenue():
+    records = [record("one", 49900, execution_success=True)]
+    assert total_amount_recovered(records) == 0
+    assert total_amount_at_risk(records) == 49900
 
 
 def test_recovery_rate_uses_amount_at_risk_denominator():
-    records = [record("one", 500, success=True), record("two", 500)]
-    assert recovery_rate(records) == 0.5
+    records = [record("one", 500), record("two", 500)]
+    assert recovery_rate(records, [outcome("one", 500, status="captured")]) == 0.5
+
+
+def test_provider_confirmed_captured_outcome_counts_exactly_once():
+    records = [record("one", 500)]
+    confirmations = [outcome("one", 500, status="captured")]
+    assert total_amount_recovered(records, confirmations) == 500
+
+
+def test_duplicate_provider_confirmations_do_not_double_count():
+    records = [record("one", 500)]
+    confirmations = [outcome("one", 500), outcome("one", 500)]
+    assert total_amount_recovered(records, confirmations) == 500
+
+
+@pytest.mark.parametrize("status", ["failed", "authorized", "created", "refunded"])
+def test_non_success_provider_states_do_not_count_as_recovered(status):
+    records = [record("one", 500)]
+    assert total_amount_recovered(records, [outcome("one", 500, status=status)]) == 0
 
 
 def test_zero_eligible_amount_has_zero_rate():
@@ -77,6 +114,6 @@ def test_systemic_and_customer_attempts_are_separated():
 
 
 def test_permitted_recovery_is_not_counted_as_recovered_without_success():
-    item = record("permitted", 100, success=False)
+    item = record("permitted", 100)
     assert number_of_recovery_actions([item]) == 1
     assert total_amount_recovered([item]) == 0

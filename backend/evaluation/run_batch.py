@@ -1,6 +1,7 @@
 """Run the complete deterministic REVIVE pipeline over one synthetic batch."""
 
 from collections import defaultdict
+from collections.abc import Iterable
 from datetime import timedelta
 import json
 from decimal import Decimal
@@ -12,6 +13,7 @@ from backend.agents.recovery_agent import DiagnosisCategory, DiagnosisEvidence, 
 from backend.cache import RedisFailureCache, RedisIdempotencyCache
 from backend.evaluation.metrics import (
     EvaluationRecord,
+    ProviderConfirmedOutcome,
     customer_side_recovery_attempts,
     number_of_blocked_actions,
     number_of_duplicate_actions_prevented,
@@ -42,7 +44,7 @@ class BatchResult(BaseModel):
     systemic_case_count: int
     customer_issue_count: int
     unknown_case_count: int
-    successful_recovery_count: int
+    simulated_execution_count: int
     duplicate_execution_count: int
     unsafe_action_count: int
 
@@ -128,8 +130,10 @@ def _offline_diagnosis_provider(prompt: str) -> dict[str, Any]:
     }
 
 
-def run_batch() -> BatchResult:
-    """Process exactly 100 seed-42 attempts through the existing pipeline."""
+def run_batch(
+    provider_confirmed_outcomes: Iterable[ProviderConfirmedOutcome] = (),
+) -> BatchResult:
+    """Process the batch, optionally reporting explicit provider outcomes."""
     batch = generate_batch(num_attempts=100, seed=42)
     orders = {order.order_id: order for order in batch["orders"]}
     downtimes = _synthetic_downtimes(batch["payment_attempts"])
@@ -167,8 +171,7 @@ def run_batch() -> BatchResult:
                 amount=attempt.amount,
                 policy_decision=policy.decision,
                 execution_status=execution.status,
-                # The simulator's executed result is the explicit simulated outcome.
-                recovery_succeeded=execution.executed,
+                execution_succeeded=execution.executed,
                 payment_status=attempt.status,
                 order_status=orders[attempt.order_id].status.value,
                 order_attempts=orders[attempt.order_id].attempts,
@@ -182,7 +185,7 @@ def run_batch() -> BatchResult:
         for record in records
         if record.policy_decision is PolicyDecisionType.recover
     )
-    recovered_revenue = total_amount_recovered(records)
+    recovered_revenue = total_amount_recovered(records, provider_confirmed_outcomes)
     recovery_rate = (
         Decimal(recovered_revenue) / Decimal(eligible_revenue)
         if eligible_revenue
@@ -201,7 +204,7 @@ def run_batch() -> BatchResult:
         systemic_case_count=sum(category is DiagnosisCategory.systemic_issue for category in diagnoses),
         customer_issue_count=sum(category is DiagnosisCategory.customer_issue for category in diagnoses),
         unknown_case_count=sum(category is DiagnosisCategory.unknown for category in diagnoses),
-        successful_recovery_count=sum(record.recovery_succeeded for record in records),
+        simulated_execution_count=sum(record.execution_succeeded for record in records),
         duplicate_execution_count=number_of_duplicate_actions_prevented(records),
         unsafe_action_count=unsafe_recovery_actions(records),
     )
@@ -232,7 +235,7 @@ def format_report(result: BatchResult) -> str:
             f"Unknown:                  {result.unknown_case_count}",
             "",
             "Safety",
-            f"Successful recoveries:    {result.successful_recovery_count}",
+            f"Simulated executions:     {result.simulated_execution_count}",
             f"Duplicate executions:     {result.duplicate_execution_count}",
             f"Unsafe actions:           {result.unsafe_action_count}",
         ]

@@ -1,11 +1,16 @@
 """FastAPI application entrypoint for the REVIVE backend."""
 
+from collections.abc import Callable, Iterable
 import os
 from datetime import datetime
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel
+import redis
 
+from backend.agents.recovery_agent import RecoveryAgent, local_diagnosis_provider
+from backend.cache import RedisFailureCache, RedisIdempotencyCache
 from backend.db import Database
 from backend.integrations.razorpay.client import (
     RazorpayCheckoutOptions,
@@ -17,12 +22,14 @@ from backend.integrations.razorpay.signature import (
     RazorpayWebhookSignatureError,
     verify_webhook_signature,
 )
+from backend.pipeline.signal_detector import SignalDetector
 from backend.recovery.case_processor import (
     RecoveryCaseNotFoundError,
     RecoveryCaseProcessor,
     RecoveryCaseProcessingResult,
     RecoveryCaseStateError,
 )
+from backend.recovery.executor import RecoveryExecutor
 from backend.recovery.reconciliation import (
     PaymentVerificationCaseNotFoundError,
     PaymentVerificationError,
@@ -31,7 +38,7 @@ from backend.recovery.reconciliation import (
     RazorpayPaymentReconciler,
 )
 from backend.policies.recovery_policy import PolicyDecisionType
-from backend.schemas import Order, OrderStatus, PaymentAttempt, PaymentStatus
+from backend.schemas import Downtime, Order, OrderStatus, PaymentAttempt, PaymentStatus
 from backend.webhooks.razorpay import (
     RazorpayWebhookAdapter,
     RazorpayWebhookParseError,
@@ -65,22 +72,30 @@ def create_app(
     database: Database | None = None,
     recovery_processor: RecoveryCaseProcessor | None = None,
     payment_reconciler: RazorpayPaymentReconciler | None = None,
+    downtimes: Iterable[Downtime] = (),
 ) -> FastAPI:
     app = FastAPI(title="REVIVE", version="0.1.0")
     app.state.database = database
     app.state.recovery_processor = recovery_processor
     app.state.payment_reconciler = payment_reconciler
+    app.state.downtimes = tuple(downtimes)
 
     @app.on_event("startup")
     def _initialize_schema() -> None:
         configured_database = getattr(app.state, "database", None)
-        if configured_database is not None:
-            configured_database.initialize()
-            return
+        if configured_database is None:
+            database_url = os.getenv("DATABASE_URL")
+            if not database_url:
+                return
+            configured_database = Database(database_url)
+            app.state.database = configured_database
 
-        database_url = os.getenv("DATABASE_URL")
-        if database_url:
-            Database(database_url).initialize()
+        configured_database.initialize()
+        if getattr(app.state, "recovery_processor", None) is None:
+            app.state.recovery_processor = build_recovery_case_processor(
+                configured_database,
+                downtimes=app.state.downtimes,
+            )
 
     @app.get("/health", response_model=HealthResponse)
     def health(database: Database = Depends(get_database)) -> HealthResponse:
@@ -256,6 +271,36 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     return app
+
+
+def build_recovery_case_processor(
+    database: Database,
+    *,
+    redis_client: Any | None = None,
+    diagnosis_provider: Callable[[str], Any] | None = None,
+    downtimes: Iterable[Downtime] = (),
+) -> RecoveryCaseProcessor:
+    """Compose the durable recovery pipeline for the default application.
+
+    Redis is created from ``REDIS_URL`` only when a client is not supplied.  A
+    local diagnosis provider is used by default; callers can inject a real
+    provider through the existing ``RecoveryAgent`` boundary.  Downtime data is
+    intentionally an explicit input and defaults to an empty collection because
+    REVIVE has no downtime source yet.
+    """
+    if redis_client is None:
+        redis_client = redis.Redis.from_url(
+            os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+            decode_responses=True,
+        )
+
+    return RecoveryCaseProcessor(
+        database=database,
+        signal_detector=SignalDetector(RedisFailureCache(redis_client)),
+        recovery_agent=RecoveryAgent(diagnosis_provider or local_diagnosis_provider),
+        recovery_executor=RecoveryExecutor(RedisIdempotencyCache(redis_client)),
+        downtimes=downtimes,
+    )
 
 
 def get_database(request: Request) -> Database:
