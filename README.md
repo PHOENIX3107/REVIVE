@@ -8,7 +8,10 @@ The system detects population-level payment failure patterns, correlates them wi
 
 ## Architecture
 
-Razorpay → Webhook ingestion → State normalization → Population signal detection → Downtime correlation → AI diagnosis → Deterministic policy → Bounded executor → Audit and evaluation
+Razorpay API polling → State normalization → Population signal detection → Downtime correlation → AI diagnosis → Deterministic policy → Bounded executor → Audit and evaluation
+
+Signed Razorpay webhooks remain an optional compatibility/fast-path ingestion
+mechanism; recovery reconciliation does not depend on webhook delivery.
 
 ## Safety boundary
 
@@ -26,7 +29,11 @@ source is added.
 
 The integration is restricted to Test Mode. REVIVE uses the existing Razorpay order_id and does not create replacement orders.
 
-The system handles payment.failed, payment.captured, order.paid, webhook deduplication, out-of-order delivery, monotonic state transitions, and HMAC webhook signature verification.
+The polling worker discovers unresolved recovery cases from PostgreSQL and uses
+read-only Razorpay Payment/Order API verification. The system also supports
+`payment.failed`, `payment.captured`, and `order.paid` webhooks as an optional
+compatibility path with deduplication, out-of-order delivery handling,
+monotonic state transitions, and HMAC signature verification.
 
 ## Tech stack
 
@@ -63,9 +70,12 @@ export DATABASE_URL="postgresql://revive:revive@localhost:5432/revive"
 export REDIS_URL="redis://localhost:6379/0"
 export RAZORPAY_KEY_ID="rzp_test_..."
 export RAZORPAY_KEY_SECRET="..."
+# Optional: only needed when enabling the webhook compatibility path.
 export RAZORPAY_WEBHOOK_SECRET="..."
 export REVIVE_API_BASE_URL="http://127.0.0.1:8000"
 export REVIVE_FRONTEND_PORT="3000"
+export REVIVE_RECONCILIATION_POLL_INTERVAL_SECONDS="60"
+export REVIVE_RECONCILIATION_BATCH_SIZE="50"
 ```
 
 Start the API:
@@ -73,6 +83,18 @@ Start the API:
 ```bash
 uvicorn backend.main:app --reload
 ```
+
+Start the primary reconciliation worker in another terminal. It does not
+require `RAZORPAY_WEBHOOK_SECRET`:
+
+```bash
+./.venv/bin/python -m backend.workers.payment_reconciliation
+```
+
+The worker polls unresolved PostgreSQL recovery cases, verifies each existing
+Razorpay payment/order pair, and relies on the existing reconciler to persist
+provider-confirmed outcomes. It handles transient failures with bounded retry
+and backoff and shuts down cleanly on SIGTERM/SIGINT.
 
 Health check:
 

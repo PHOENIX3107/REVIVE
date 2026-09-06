@@ -22,6 +22,10 @@ export RAZORPAY_WEBHOOK_SECRET="..."
 The application rejects key IDs that are not prefixed with `rzp_test_`. Never
 put a key or secret in source control.
 
+`RAZORPAY_WEBHOOK_SECRET` is optional for the polling path. The reconciliation
+worker uses only `DATABASE_URL`, `RAZORPAY_KEY_ID`, and
+`RAZORPAY_KEY_SECRET`.
+
 Start the local dependencies and the API:
 
 ```sh
@@ -29,15 +33,27 @@ docker compose up -d postgres redis
 ./.venv/bin/uvicorn backend.main:app --reload
 ```
 
-Configure a Razorpay Test Mode webhook for the reachable API URL
+Start the primary polling worker in a second terminal:
+
+```sh
+./.venv/bin/python -m backend.workers.payment_reconciliation
+```
+
+The worker polls open recovery cases from PostgreSQL, verifies the existing
+Razorpay payment and order, and uses the existing reconciler to persist
+provider-confirmed state. It does not create orders or call a retry/collection
+API.
+
+Optionally configure a Razorpay Test Mode webhook for the reachable API URL
 `/webhooks/razorpay`. Use the same webhook secret as
 `RAZORPAY_WEBHOOK_SECRET` and subscribe to `payment.failed`,
 `payment.captured`, and `order.paid`. For a local API, use an HTTPS tunnel
-only for this test.
+only for this optional compatibility path.
 
-If webhook delivery is unavailable, the API verification fallback can be run
-against the same Test Mode credentials. It uses only the documented read-only
-payment and order resources and does not replace the webhook path.
+If both the optional webhook and worker are unavailable, the API verification
+endpoint can be run against the same Test Mode credentials. It uses only the
+documented read-only payment and order resources and does not create a retry
+or collection request.
 
 ## Run one customer retry flow
 

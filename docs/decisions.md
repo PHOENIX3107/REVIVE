@@ -20,13 +20,16 @@ REVIVE uses the persisted `order_id` throughout the recovery flow. The customer
 checkout boundary presents that existing order to Razorpay Checkout; REVIVE does
 not create replacement orders or expose an invented server-side retry API.
 
-## Provider confirmation is webhook-first
+## Provider confirmation is polling-first
 
-Signed `payment.captured` and `order.paid` events are the normal success path.
-The verification endpoint is a read-only Test Mode API fallback for an existing
-recovery case and validates the exact payment, order, amount, and currency before
-persisting a recovered outcome. Webhook deduplication, monotonic state handling,
-and transaction boundaries are preserved.
+The payment reconciliation worker polls unresolved PostgreSQL recovery cases and
+uses read-only Test Mode Payment/Order API verification as the primary
+operational path. The API endpoint performs the same verification for a single
+case. Signed `payment.captured` and `order.paid` events remain an optional
+compatibility/fast-path path. Every path validates the exact payment, order,
+amount, and currency before persisting a recovered outcome. Webhook
+deduplication, monotonic state handling, and transaction boundaries are
+preserved.
 
 ## Safe local defaults are explicit
 

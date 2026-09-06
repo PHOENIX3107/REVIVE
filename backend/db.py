@@ -219,6 +219,59 @@ class Database:
             ).fetchone()
         return dict(row) if row else None
 
+    def get_reconciliation_candidates(self, limit: int) -> list[str]:
+        """Return durable recovery cases that still need provider verification.
+
+        The recovery case status and provider outcome are the durable queue
+        boundary. No in-memory queue or worker-specific columns are required.
+        Cases are ordered oldest-first so a repeatedly failing case cannot
+        permanently starve newer unresolved cases.
+        """
+        if limit <= 0:
+            return []
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT rc.case_id
+                FROM recovery_cases AS rc
+                JOIN payment_attempts AS p ON p.payment_id = rc.payment_id
+                JOIN orders AS o ON o.order_id = rc.order_id
+                WHERE rc.status = 'open'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM payment_outcomes AS po
+                      WHERE po.payment_id = rc.payment_id
+                        AND po.status = 'recovered'
+                  )
+                ORDER BY rc.updated_at ASC, rc.created_at ASC, rc.case_id ASC
+                LIMIT %s
+                """,
+                (limit,),
+            ).fetchall()
+        return [str(row["case_id"]) for row in rows]
+
+    def case_needs_reconciliation(self, case_id: str) -> bool:
+        """Re-check a candidate after a worker acquires its case lock."""
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM recovery_cases AS rc
+                JOIN payment_attempts AS p ON p.payment_id = rc.payment_id
+                JOIN orders AS o ON o.order_id = rc.order_id
+                WHERE rc.case_id = %s
+                  AND rc.status = 'open'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM payment_outcomes AS po
+                      WHERE po.payment_id = rc.payment_id
+                        AND po.status = 'recovered'
+                  )
+                """,
+                (case_id,),
+            ).fetchone()
+        return row is not None
+
     def get_recovery_diagnosis(self, case_id: str) -> Diagnosis | None:
         with self.connection() as connection:
             row = connection.execute(
