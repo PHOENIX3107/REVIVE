@@ -16,6 +16,12 @@ Razorpay → Webhook ingestion → State normalization → Population signal det
 
 A recovery decision or simulated execution is not counted as recovered revenue. Revenue is considered recovered only after provider confirmation through the payment lifecycle/webhook.
 
+The default diagnosis provider is deterministic and local. The recovery executor
+is intentionally simulated: it records a bounded action but never retries or
+collects a Razorpay payment. The synthetic generator and batch evaluator are
+evaluation-only. Downtime is reported as unavailable until a real persisted
+source is added.
+
 ## Razorpay integration
 
 The integration is restricted to Test Mode. REVIVE uses the existing Razorpay order_id and does not create replacement orders.
@@ -38,7 +44,9 @@ The system handles payment.failed, payment.captured, order.paid, webhook dedupli
 Start PostgreSQL and Redis:
 
 ```bash
-docker compose up -d postgres redis
+cp .env.example .env
+# Replace local placeholders in .env; never commit this file.
+docker compose --env-file .env up -d postgres redis
 ```
 
 Install dependencies:
@@ -56,6 +64,8 @@ export REDIS_URL="redis://localhost:6379/0"
 export RAZORPAY_KEY_ID="rzp_test_..."
 export RAZORPAY_KEY_SECRET="..."
 export RAZORPAY_WEBHOOK_SECRET="..."
+export REVIVE_API_BASE_URL="http://127.0.0.1:8000"
+export REVIVE_FRONTEND_PORT="3000"
 ```
 
 Start the API:
@@ -70,10 +80,51 @@ Health check:
 curl http://localhost:8000/health
 ```
 
+The read-only dashboard projection is available at:
+
+```text
+GET /dashboard/overview
+GET /dashboard/recoveries
+GET /dashboard/signals
+GET /dashboard/downtime
+GET /dashboard/decisions
+GET /dashboard/audit
+```
+
+Run the dependency-light operations UI in a second terminal:
+
+```bash
+REVIVE_API_BASE_URL="http://127.0.0.1:8000" \
+  REVIVE_FRONTEND_PORT="3000" ./.venv/bin/python frontend/app.py
+```
+
+The UI reads only these PostgreSQL-backed APIs. If the API or database is
+unavailable, it shows an explicit unavailable state; it does not generate
+synthetic dashboard data.
+
+## What a real recovery means
+
+The customer checkout boundary preserves the original Razorpay `order_id` and
+returns options for Razorpay Checkout. It does not create a replacement order
+or invent a retry API. Successful recovery is recorded only after a signed
+`payment.captured`/`order.paid` lifecycle event, or the documented read-only
+Test Mode verification fallback confirms the exact payment and amount. A
+decision or simulated execution alone cannot create a payment outcome or
+recovered revenue. See `docs/razorpay-test-mode.md` for the manual Test Mode
+procedure.
+
 ## Tests
 
 ```bash
-pytest
+REVIVE_TEST_DATABASE_URL="postgresql://revive:revive@localhost:5432/revive" \
+  ./.venv/bin/pytest -q
+```
+
+For the complete local validation pass:
+
+```bash
+./.venv/bin/python -m compileall backend tests
+git diff --check
 ```
 
 ## Documentation
