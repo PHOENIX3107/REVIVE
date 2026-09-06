@@ -272,6 +272,244 @@ class Database:
             ).fetchone()
         return dict(row) if row else None
 
+    def get_dashboard_metrics(self) -> dict[str, int]:
+        """Aggregate dashboard metrics from the durable PostgreSQL state."""
+        with self.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    (SELECT count(*) FROM payment_attempts) AS payment_attempts,
+                    (SELECT count(*) FROM payment_attempts WHERE status = 'failed') AS failed_payments,
+                    (
+                        SELECT COALESCE(sum(p.amount), 0)
+                        FROM payment_attempts AS p
+                        JOIN orders AS o ON o.order_id = p.order_id
+                        WHERE p.status = 'failed' AND o.status <> 'paid'
+                    ) AS revenue_at_risk,
+                    (
+                        SELECT COALESCE(sum(p.amount), 0)
+                        FROM recovery_cases AS rc
+                        JOIN payment_attempts AS p ON p.payment_id = rc.payment_id
+                        JOIN orders AS o ON o.order_id = rc.order_id
+                        JOIN LATERAL (
+                            SELECT d.decision
+                            FROM decisions AS d
+                            WHERE d.case_id = rc.case_id
+                            ORDER BY d.created_at DESC, d.decision_id DESC
+                            LIMIT 1
+                        ) AS latest_decision ON TRUE
+                        WHERE latest_decision.decision = 'recover'
+                          AND p.status = 'failed'
+                          AND o.status <> 'paid'
+                    ) AS policy_eligible_revenue,
+                    (
+                        SELECT COALESCE(sum(amount_recovered), 0)
+                        FROM payment_outcomes
+                        WHERE status = 'recovered'
+                    ) AS recovered_revenue,
+                    (SELECT count(*) FROM executions WHERE status = 'executed') AS recovery_actions,
+                    (SELECT count(*) FROM executions WHERE status = 'blocked') AS blocked_actions,
+                    (SELECT count(*) FROM executions WHERE status = 'duplicate') AS duplicate_actions_prevented,
+                    (
+                        SELECT count(*)
+                        FROM executions AS e
+                        JOIN recovery_cases AS rc ON rc.case_id = e.case_id
+                        JOIN orders AS o ON o.order_id = rc.order_id
+                        LEFT JOIN LATERAL (
+                            SELECT d.category
+                            FROM diagnoses AS d
+                            WHERE d.case_id = rc.case_id
+                            ORDER BY d.created_at DESC, d.diagnosis_id DESC
+                            LIMIT 1
+                        ) AS latest_diagnosis ON TRUE
+                        WHERE e.status = 'executed'
+                          AND (
+                              o.status = 'paid'
+                              OR o.attempts >= 3
+                              OR latest_diagnosis.category = 'systemic_issue'
+                          )
+                    ) AS unsafe_actions,
+                    (
+                        SELECT count(DISTINCT rc.case_id)
+                        FROM recovery_cases AS rc
+                        JOIN LATERAL (
+                            SELECT d.category
+                            FROM diagnoses AS d
+                            WHERE d.case_id = rc.case_id
+                            ORDER BY d.created_at DESC, d.diagnosis_id DESC
+                            LIMIT 1
+                        ) AS latest_diagnosis ON TRUE
+                        WHERE latest_diagnosis.category = 'systemic_issue'
+                    ) AS systemic_attempts,
+                    (
+                        SELECT count(DISTINCT rc.case_id)
+                        FROM recovery_cases AS rc
+                        JOIN LATERAL (
+                            SELECT d.category
+                            FROM diagnoses AS d
+                            WHERE d.case_id = rc.case_id
+                            ORDER BY d.created_at DESC, d.diagnosis_id DESC
+                            LIMIT 1
+                        ) AS latest_diagnosis ON TRUE
+                        WHERE latest_diagnosis.category = 'customer_issue'
+                    ) AS customer_attempts
+                """
+            ).fetchone()
+        if row is None:
+            return {
+                "payment_attempts": 0,
+                "failed_payments": 0,
+                "revenue_at_risk": 0,
+                "policy_eligible_revenue": 0,
+                "recovered_revenue": 0,
+                "recovery_actions": 0,
+                "blocked_actions": 0,
+                "duplicate_actions_prevented": 0,
+                "unsafe_actions": 0,
+                "systemic_attempts": 0,
+                "customer_attempts": 0,
+            }
+        return {key: int(value or 0) for key, value in dict(row).items()}
+
+    def get_dashboard_recoveries(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """Return recovery cases with their latest durable pipeline records."""
+        query = """
+            SELECT
+                rc.case_id,
+                rc.payment_id,
+                rc.order_id,
+                p.amount,
+                p.status AS payment_status,
+                o.status AS order_status,
+                rc.status AS case_status,
+                latest_diagnosis.category AS diagnosis_category,
+                latest_diagnosis.confidence AS diagnosis_confidence,
+                latest_diagnosis.reason AS diagnosis_reason,
+                latest_decision.decision,
+                latest_decision.reason AS decision_reason,
+                latest_execution.status AS execution_status,
+                latest_execution.action AS execution_action,
+                latest_execution.reason AS execution_reason,
+                latest_execution.timestamp AS execution_timestamp,
+                po.status AS payment_outcome_status,
+                po.amount_recovered AS payment_outcome_amount,
+                po.observed_at AS payment_outcome_observed_at
+            FROM recovery_cases AS rc
+            JOIN payment_attempts AS p ON p.payment_id = rc.payment_id
+            JOIN orders AS o ON o.order_id = rc.order_id
+            LEFT JOIN LATERAL (
+                SELECT d.category, d.confidence, d.reason
+                FROM diagnoses AS d
+                WHERE d.case_id = rc.case_id
+                ORDER BY d.created_at DESC, d.diagnosis_id DESC
+                LIMIT 1
+            ) AS latest_diagnosis ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT d.decision, d.reason
+                FROM decisions AS d
+                WHERE d.case_id = rc.case_id
+                ORDER BY d.created_at DESC, d.decision_id DESC
+                LIMIT 1
+            ) AS latest_decision ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT e.status, e.action, e.reason, e.timestamp
+                FROM executions AS e
+                WHERE e.case_id = rc.case_id
+                ORDER BY e.timestamp DESC, e.execution_id DESC
+                LIMIT 1
+            ) AS latest_execution ON TRUE
+            LEFT JOIN payment_outcomes AS po ON po.payment_id = rc.payment_id
+            ORDER BY rc.updated_at DESC, rc.created_at DESC, rc.case_id DESC
+        """
+        parameters: tuple[int, ...] = ()
+        if limit is not None:
+            query += " LIMIT %s"
+            parameters = (max(0, limit),)
+        with self.connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_dashboard_signals(self) -> list[dict[str, Any]]:
+        """Group persisted failed payments by issuer BIN and error code."""
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    issuer_bin,
+                    error ->> 'code' AS error_code,
+                    count(*) AS failure_count,
+                    COALESCE(sum(amount), 0) AS total_amount,
+                    max(failed_at) AS latest_failed_at
+                FROM payment_attempts
+                WHERE status = 'failed'
+                GROUP BY issuer_bin, error ->> 'code'
+                ORDER BY latest_failed_at DESC NULLS LAST, issuer_bin, error_code
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_dashboard_decisions(self) -> list[dict[str, Any]]:
+        """Return persisted decisions with their case and latest diagnosis."""
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    d.decision_id,
+                    rc.case_id,
+                    rc.payment_id,
+                    rc.order_id,
+                    p.amount,
+                    p.status AS payment_status,
+                    o.status AS order_status,
+                    latest_diagnosis.category AS diagnosis_category,
+                    latest_diagnosis.confidence AS diagnosis_confidence,
+                    latest_diagnosis.reason AS diagnosis_reason,
+                    d.decision,
+                    d.reason AS decision_reason,
+                    d.created_at AS decision_created_at
+                FROM decisions AS d
+                JOIN recovery_cases AS rc ON rc.case_id = d.case_id
+                JOIN payment_attempts AS p ON p.payment_id = rc.payment_id
+                JOIN orders AS o ON o.order_id = rc.order_id
+                LEFT JOIN LATERAL (
+                    SELECT diagnosis.category, diagnosis.confidence, diagnosis.reason
+                    FROM diagnoses AS diagnosis
+                    WHERE diagnosis.case_id = rc.case_id
+                    ORDER BY diagnosis.created_at DESC, diagnosis.diagnosis_id DESC
+                    LIMIT 1
+                ) AS latest_diagnosis ON TRUE
+                ORDER BY d.created_at DESC, d.decision_id DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_dashboard_audit(self) -> list[dict[str, Any]]:
+        """Return persisted audit events with associated durable resources."""
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    a.audit_id,
+                    a.case_id,
+                    a.payment_id,
+                    a.order_id,
+                    p.amount,
+                    p.status AS payment_status,
+                    o.status AS order_status,
+                    a.policy_decision,
+                    a.action,
+                    a.status,
+                    a.reason,
+                    a.timestamp
+                FROM audit_events AS a
+                JOIN recovery_cases AS rc ON rc.case_id = a.case_id
+                JOIN payment_attempts AS p ON p.payment_id = a.payment_id
+                JOIN orders AS o ON o.order_id = a.order_id
+                ORDER BY a.timestamp DESC, a.audit_id DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def _save_recovery_case(
         self,
         connection: psycopg.Connection[Any],

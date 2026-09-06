@@ -11,6 +11,15 @@ import redis
 
 from backend.agents.recovery_agent import RecoveryAgent, local_diagnosis_provider
 from backend.cache import RedisFailureCache, RedisIdempotencyCache
+from backend.dashboard import (
+    DashboardAuditRow,
+    DashboardDecisionRow,
+    DashboardDowntimeResponse,
+    DashboardMetrics,
+    DashboardOverviewResponse,
+    DashboardRecoveryRow,
+    DashboardSignalRow,
+)
 from backend.db import Database
 from backend.integrations.razorpay.client import (
     RazorpayCheckoutOptions,
@@ -107,6 +116,50 @@ def create_app(
                 detail="Database health check failed.",
             ) from exc
         return HealthResponse()
+
+    @app.get("/dashboard/overview", response_model=DashboardOverviewResponse)
+    def dashboard_overview(database: Database = Depends(get_database)) -> DashboardOverviewResponse:
+        return DashboardOverviewResponse(
+            metrics=DashboardMetrics(**database.get_dashboard_metrics()),
+            recent_cases=[
+                DashboardRecoveryRow.model_validate(row)
+                for row in database.get_dashboard_recoveries(limit=10)
+            ],
+        )
+
+    @app.get("/dashboard/recoveries", response_model=list[DashboardRecoveryRow])
+    def dashboard_recoveries(
+        database: Database = Depends(get_database),
+    ) -> list[DashboardRecoveryRow]:
+        return [
+            DashboardRecoveryRow.model_validate(row)
+            for row in database.get_dashboard_recoveries()
+        ]
+
+    @app.get("/dashboard/signals", response_model=list[DashboardSignalRow])
+    def dashboard_signals(
+        database: Database = Depends(get_database),
+    ) -> list[DashboardSignalRow]:
+        return [DashboardSignalRow.model_validate(row) for row in database.get_dashboard_signals()]
+
+    @app.get("/dashboard/downtime", response_model=DashboardDowntimeResponse)
+    def dashboard_downtime() -> DashboardDowntimeResponse:
+        return DashboardDowntimeResponse(available=False, items=[])
+
+    @app.get("/dashboard/decisions", response_model=list[DashboardDecisionRow])
+    def dashboard_decisions(
+        database: Database = Depends(get_database),
+    ) -> list[DashboardDecisionRow]:
+        return [
+            DashboardDecisionRow.model_validate(row)
+            for row in database.get_dashboard_decisions()
+        ]
+
+    @app.get("/dashboard/audit", response_model=list[DashboardAuditRow])
+    def dashboard_audit(
+        database: Database = Depends(get_database),
+    ) -> list[DashboardAuditRow]:
+        return [DashboardAuditRow.model_validate(row) for row in database.get_dashboard_audit()]
 
     @app.get("/orders/{order_id}", response_model=Order)
     def get_order(order_id: str, database: Database = Depends(get_database)) -> Order:
