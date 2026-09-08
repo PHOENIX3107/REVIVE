@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from backend.db import Database
+from backend.population_incidents import PopulationIncidentActivator
 from backend.schemas import Order, OrderStatus, PaymentAttempt, PaymentError, PaymentMethod, PaymentStatus
 
 
@@ -330,9 +331,15 @@ class RazorpayWebhookAdapter:
 class RazorpayWebhookProcessor:
     """Persist Razorpay webhook events with monotonic state updates."""
 
-    def __init__(self, database: Database, adapter: RazorpayWebhookAdapter | None = None) -> None:
+    def __init__(
+        self,
+        database: Database,
+        adapter: RazorpayWebhookAdapter | None = None,
+        population_incident_activator: PopulationIncidentActivator | None = None,
+    ) -> None:
         self.database = database
         self.adapter = adapter or RazorpayWebhookAdapter()
+        self.population_incident_activator = population_incident_activator
 
     def ingest(self, raw_body: bytes, headers: Mapping[str, str]) -> WebhookIngestResult:
         event = self.adapter.parse(raw_body, headers)
@@ -391,6 +398,11 @@ class RazorpayWebhookProcessor:
             merged_order = self.adapter.merge_order_state(base_order, payment_state, attempt_count)
             self._persist_order_state(connection, merged_order)
             if payment_state.attempt.status is PaymentStatus.failed:
+                if self.population_incident_activator is not None:
+                    self.population_incident_activator.observe_failure(
+                        payment_state.attempt,
+                        connection=connection,
+                    )
                 self._create_recovery_case_if_eligible(connection, payment_state, base_order)
             elif payment_state.attempt.status is PaymentStatus.captured:
                 self.database._save_provider_recovered_outcome(

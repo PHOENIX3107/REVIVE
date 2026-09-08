@@ -1,7 +1,7 @@
 """Minimal PostgreSQL persistence for REVIVE domain and execution records."""
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -12,7 +12,14 @@ from psycopg.rows import dict_row
 
 from backend.agents.recovery_agent import Diagnosis, DiagnosisCategory
 from backend.recovery.executor import AuditRecord, ExecutionResult
-from backend.schemas import Order, PaymentAttempt, PaymentError, PaymentMethod, PaymentStatus
+from backend.schemas import (
+    Order,
+    PaymentAttempt,
+    PaymentError,
+    PaymentMethod,
+    PaymentStatus,
+    PopulationIncidentContext,
+)
 from backend.policies.recovery_policy import PolicyDecision, PolicyDecisionType
 
 
@@ -217,6 +224,148 @@ class Database:
                 "SELECT * FROM recovery_cases WHERE case_id = %s",
                 (case_id,),
             ).fetchone()
+        return dict(row) if row else None
+
+    def get_active_population_incident(
+        self,
+        cohort_key: str,
+        observed_at: datetime,
+    ) -> dict[str, Any] | None:
+        """Read an unexpired active incident and close stale generations."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE population_incidents
+                SET status = 'EXPIRED',
+                    resolved_at = expires_at,
+                    updated_at = %s
+                WHERE cohort_key = %s
+                  AND status = 'ACTIVE'
+                  AND expires_at <= %s
+                """,
+                (observed_at, cohort_key, observed_at),
+            )
+            row = connection.execute(
+                """
+                SELECT *
+                FROM population_incidents
+                WHERE cohort_key = %s
+                  AND status = 'ACTIVE'
+                  AND expires_at > %s
+                ORDER BY activated_at DESC, incident_id DESC
+                LIMIT 1
+                """,
+                (cohort_key, observed_at),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def _activate_population_incident(
+        self,
+        connection: psycopg.Connection[Any],
+        *,
+        cohort_key: str,
+        issuer_bin: str,
+        error_code: str,
+        threshold: int,
+        window_seconds: int,
+        observed_count: int,
+        trigger_payment_id: str,
+        observed_at: datetime,
+        unique_observation: bool,
+        incident_id: str,
+    ) -> dict[str, Any] | None:
+        """Atomically expire, reuse, or create one cohort incident.
+
+        The advisory transaction lock serializes activation for a cohort. The
+        partial unique index remains a second durable guard against duplicate
+        active generations.
+        """
+        connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (cohort_key,),
+        )
+        active = connection.execute(
+            """
+            SELECT *
+            FROM population_incidents
+            WHERE cohort_key = %s AND status = 'ACTIVE'
+            FOR UPDATE
+            """,
+            (cohort_key,),
+        ).fetchone()
+
+        if active and active["expires_at"] <= observed_at:
+            connection.execute(
+                """
+                UPDATE population_incidents
+                SET status = 'EXPIRED',
+                    resolved_at = expires_at,
+                    updated_at = %s
+                WHERE incident_id = %s
+                """,
+                (observed_at, active["incident_id"]),
+            )
+            active = None
+
+        if active:
+            if (
+                unique_observation
+                and observed_at > active["last_qualifying_observed_at"]
+            ):
+                connection.execute(
+                    """
+                    UPDATE population_incidents
+                    SET last_qualifying_observed_at = %s,
+                        expires_at = %s,
+                        updated_at = %s
+                    WHERE incident_id = %s
+                    """,
+                    (
+                        observed_at,
+                        observed_at + timedelta(seconds=active["window_seconds"]),
+                        observed_at,
+                        active["incident_id"],
+                    ),
+                )
+                active = connection.execute(
+                    "SELECT * FROM population_incidents WHERE incident_id = %s",
+                    (active["incident_id"],),
+                ).fetchone()
+            return dict(active)
+
+        # A new incident generation requires a new unique observed failure.
+        # A duplicate delivery must never reactivate a cohort from the same
+        # Redis window after an earlier generation expires.
+        if not unique_observation or observed_count < threshold:
+            return None
+
+        connection.execute(
+            """
+            INSERT INTO population_incidents
+                (incident_id, cohort_key, issuer_bin, error_code, status,
+                 threshold, window_seconds, observed_count_at_activation,
+                 trigger_payment_id, activated_at, last_qualifying_observed_at,
+                 expires_at)
+            VALUES (%s, %s, %s, %s, 'ACTIVE', %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                incident_id,
+                cohort_key,
+                issuer_bin,
+                error_code,
+                threshold,
+                window_seconds,
+                observed_count,
+                trigger_payment_id,
+                observed_at,
+                observed_at,
+                observed_at + timedelta(seconds=window_seconds),
+            ),
+        )
+        row = connection.execute(
+            "SELECT * FROM population_incidents WHERE incident_id = %s",
+            (incident_id,),
+        ).fetchone()
         return dict(row) if row else None
 
     def get_reconciliation_candidates(self, limit: int) -> list[str]:
@@ -435,6 +584,8 @@ class Database:
                 p.status AS payment_status,
                 o.status AS order_status,
                 rc.status AS case_status,
+                p.issuer_bin,
+                p.error ->> 'code' AS error_code,
                 latest_diagnosis.category AS diagnosis_category,
                 latest_diagnosis.confidence AS diagnosis_confidence,
                 latest_diagnosis.reason AS diagnosis_reason,
@@ -446,7 +597,13 @@ class Database:
                 latest_execution.timestamp AS execution_timestamp,
                 po.status AS payment_outcome_status,
                 po.amount_recovered AS payment_outcome_amount,
-                po.observed_at AS payment_outcome_observed_at
+                po.observed_at AS payment_outcome_observed_at,
+                rc.population_signal_detected,
+                rc.population_incident_active,
+                rc.population_incident_id,
+                rc.population_incident_cohort_key,
+                rc.population_incident_activated_at,
+                rc.population_incident_expires_at
             FROM recovery_cases AS rc
             JOIN payment_attempts AS p ON p.payment_id = rc.payment_id
             JOIN orders AS o ON o.order_id = rc.order_id
@@ -480,6 +637,32 @@ class Database:
             parameters = (max(0, limit),)
         with self.connection() as connection:
             rows = connection.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_dashboard_population_incidents(self) -> list[dict[str, Any]]:
+        """Return currently active, unexpired durable population incidents."""
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    incident_id,
+                    cohort_key,
+                    issuer_bin,
+                    error_code,
+                    status,
+                    threshold,
+                    window_seconds,
+                    observed_count_at_activation,
+                    trigger_payment_id,
+                    activated_at,
+                    last_qualifying_observed_at,
+                    expires_at
+                FROM population_incidents
+                WHERE status = 'ACTIVE'
+                  AND expires_at > CURRENT_TIMESTAMP
+                ORDER BY activated_at DESC, incident_id DESC
+                """
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def get_dashboard_signals(self) -> list[dict[str, Any]]:
@@ -632,6 +815,9 @@ class Database:
         decision: PolicyDecision,
         execution: ExecutionResult,
         idempotency_key: str,
+        *,
+        population_signal_detected: bool = False,
+        population_incident: PopulationIncidentContext | None = None,
     ) -> bool:
         """Atomically persist one case's diagnosis, decision, execution, and audit.
 
@@ -653,6 +839,30 @@ class Database:
                 ).fetchone()
                 if existing:
                     return False
+
+                incident = population_incident or PopulationIncidentContext()
+                connection.execute(
+                    """
+                    UPDATE recovery_cases
+                    SET population_signal_detected = %s,
+                        population_incident_active = %s,
+                        population_incident_id = %s,
+                        population_incident_cohort_key = %s,
+                        population_incident_activated_at = %s,
+                        population_incident_expires_at = %s,
+                        updated_at = now()
+                    WHERE case_id = %s
+                    """,
+                    (
+                        population_signal_detected,
+                        incident.population_incident_active,
+                        incident.population_incident_id,
+                        incident.cohort_key,
+                        incident.population_incident_activated_at,
+                        incident.population_incident_expires_at,
+                        case_id,
+                    ),
+                )
 
                 connection.execute(
                     "INSERT INTO diagnoses (case_id, category, confidence, reason) VALUES (%s, %s, %s, %s)",

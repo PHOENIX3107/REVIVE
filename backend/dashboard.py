@@ -28,6 +28,8 @@ class DashboardRecoveryRow(BaseModel):
     payment_status: str
     order_status: str
     case_status: str
+    issuer_bin: str | None = None
+    error_code: str | None = None
     diagnosis_category: str | None = None
     diagnosis_confidence: float | None = None
     diagnosis_reason: str | None = None
@@ -40,6 +42,12 @@ class DashboardRecoveryRow(BaseModel):
     payment_outcome_status: str | None = None
     payment_outcome_amount: int | None = None
     payment_outcome_observed_at: datetime | None = None
+    population_signal_detected: bool = False
+    population_incident_active: bool = False
+    population_incident_id: str | None = None
+    population_incident_cohort_key: str | None = None
+    population_incident_activated_at: datetime | None = None
+    population_incident_expires_at: datetime | None = None
 
 
 class DashboardOverviewResponse(BaseModel):
@@ -58,6 +66,21 @@ class DashboardSignalRow(BaseModel):
 class DashboardDowntimeResponse(BaseModel):
     available: bool
     items: list[dict[str, Any]]
+
+
+class DashboardPopulationIncidentRow(BaseModel):
+    incident_id: str
+    cohort_key: str
+    issuer_bin: str
+    error_code: str
+    status: str
+    threshold: int
+    window_seconds: int
+    observed_count_at_activation: int
+    trigger_payment_id: str
+    activated_at: datetime
+    last_qualifying_observed_at: datetime
+    expires_at: datetime
 
 
 class DashboardDecisionRow(BaseModel):

@@ -27,6 +27,10 @@ class FakeRedis:
     def zcard(self, key):
         return len(self.sorted_sets.get(key, {}))
 
+    def zcount(self, key, minimum, maximum):
+        minimum = float(minimum)
+        return sum(score >= minimum for score in self.sorted_sets.get(key, {}).values())
+
     def expire(self, key, seconds):
         self.ttls[key] = seconds
 
@@ -105,3 +109,49 @@ def test_duplicate_payment_event_does_not_inflate_count():
     signal_detector.detect(payment("duplicate", at=at))
     context = signal_detector.detect(payment("duplicate", at=at))
     assert context.matching_failure_count == 1
+
+
+def test_count_failures_is_read_only():
+    redis = FakeRedis()
+    failure_cache = RedisFailureCache(redis)
+    at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    failure_cache.record_failure(
+        "411111",
+        "issuer_declined",
+        occurred_at=at,
+        payment_id="old",
+    )
+    before = {key: values.copy() for key, values in redis.sorted_sets.items()}
+
+    assert failure_cache.count_failures(
+        "411111",
+        "issuer_declined",
+        occurred_at=at + timedelta(seconds=601),
+    ) == 0
+    assert redis.sorted_sets == before
+
+
+def test_detect_records_once_then_reads_the_population_count():
+    class CountingFailureCache(RedisFailureCache):
+        def __init__(self):
+            super().__init__(FakeRedis())
+            self.record_calls = 0
+            self.count_calls = 0
+
+        def record_failure(self, *args, **kwargs):
+            self.record_calls += 1
+            return super().record_failure(*args, **kwargs)
+
+        def count_failures(self, *args, **kwargs):
+            self.count_calls += 1
+            return super().count_failures(*args, **kwargs)
+
+    failure_cache = CountingFailureCache()
+    signal_detector = SignalDetector(failure_cache)
+    at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    context = signal_detector.detect(payment("current", at=at))
+
+    assert context.matching_failure_count == 1
+    assert failure_cache.record_calls == 1
+    assert failure_cache.count_calls == 1

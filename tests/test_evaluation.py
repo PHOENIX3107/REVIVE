@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import pytest
 
 from backend.evaluation.metrics import (
@@ -7,6 +9,11 @@ from backend.evaluation.metrics import (
     number_of_blocked_actions,
     number_of_duplicate_actions_prevented,
     number_of_recovery_actions,
+    population_signal_false_negatives,
+    population_signal_false_positives,
+    population_signal_precision,
+    population_signal_recall,
+    population_signal_true_positives,
     recovery_rate,
     systemic_cluster_recovery_attempts,
     total_amount_at_risk,
@@ -96,7 +103,7 @@ def test_action_block_and_duplicate_counts():
 def test_unsafe_recovery_is_detected():
     records = [
         record("down", 1, downtime_matched=True),
-        record("cluster", 1, systemic_cluster=True),
+        record("cluster", 1, population_signal_detected=True),
         record("attempts", 1, order_attempts=3),
         record("paid", 1, order_status="paid"),
     ]
@@ -105,9 +112,63 @@ def test_unsafe_recovery_is_detected():
 
 def test_systemic_and_customer_attempts_are_separated():
     records = [
-        record("systemic", 1, systemic_cluster=True),
-        record("customer", 1),
-        record("blocked", 1, decision=PolicyDecisionType.stop, status="blocked", systemic_cluster=True),
+        record("systemic", 1, population_signal_detected=True),
+        record("customer", 1, ground_truth_systemic=True),
+        record(
+            "blocked",
+            1,
+            decision=PolicyDecisionType.stop,
+            status="blocked",
+            population_signal_detected=True,
+        ),
+    ]
+    assert systemic_cluster_recovery_attempts(records) == 1
+    assert customer_side_recovery_attempts(records) == 1
+
+
+def test_population_signal_true_positive():
+    records = [record("tp", 1, population_signal_detected=True, ground_truth_systemic=True)]
+    assert population_signal_true_positives(records) == 1
+
+
+def test_population_signal_false_positive():
+    records = [record("fp", 1, population_signal_detected=True, ground_truth_systemic=False)]
+    assert population_signal_false_positives(records) == 1
+
+
+def test_population_signal_false_negative():
+    records = [record("fn", 1, population_signal_detected=False, ground_truth_systemic=True)]
+    assert population_signal_false_negatives(records) == 1
+
+
+def test_population_signal_precision_and_recall():
+    records = [
+        record("tp", 1, population_signal_detected=True, ground_truth_systemic=True),
+        record("fp", 1, population_signal_detected=True, ground_truth_systemic=False),
+        record("fn", 1, population_signal_detected=False, ground_truth_systemic=True),
+    ]
+    assert population_signal_precision(records) == Decimal("0.5")
+    assert population_signal_recall(records) == Decimal("0.5")
+
+
+def test_population_signal_precision_and_recall_have_zero_denominators():
+    records = [record("none", 1)]
+    assert population_signal_precision(records) == 0
+    assert population_signal_recall(records) == 0
+
+
+def test_safety_uses_observed_signal_not_ground_truth():
+    records = [
+        record("truth-only", 1, ground_truth_systemic=True),
+        record("observed", 1, population_signal_detected=True, ground_truth_systemic=False),
+    ]
+    assert unsafe_recovery_actions(records) == 1
+
+
+def test_systemic_attempts_use_observed_signal_not_ground_truth():
+    records = [
+        record("truth-only", 1, ground_truth_systemic=True),
+        record("observed", 1, population_signal_detected=True, ground_truth_systemic=False),
     ]
     assert systemic_cluster_recovery_attempts(records) == 1
     assert customer_side_recovery_attempts(records) == 1

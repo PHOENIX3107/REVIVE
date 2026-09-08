@@ -18,6 +18,10 @@ class EvaluationRecord(BaseModel):
     order_status: str = "attempted"
     order_attempts: int = 0
     downtime_matched: bool = False
+    population_signal_detected: bool = False
+    ground_truth_systemic: bool = False
+    # Compatibility field for older evaluation callers. New metrics must use
+    # population_signal_detected and never interpret this as hidden truth.
     systemic_cluster: bool = False
 
 
@@ -94,13 +98,54 @@ def number_of_duplicate_actions_prevented(records: Iterable[EvaluationRecord]) -
     return sum(record.execution_status == "duplicate" for record in _records(records))
 
 
+def population_signal_true_positives(records: Iterable[EvaluationRecord]) -> int:
+    return sum(
+        record.population_signal_detected and record.ground_truth_systemic
+        for record in _records(records)
+    )
+
+
+def population_signal_false_positives(records: Iterable[EvaluationRecord]) -> int:
+    return sum(
+        record.population_signal_detected and not record.ground_truth_systemic
+        for record in _records(records)
+    )
+
+
+def population_signal_false_negatives(records: Iterable[EvaluationRecord]) -> int:
+    return sum(
+        not record.population_signal_detected and record.ground_truth_systemic
+        for record in _records(records)
+    )
+
+
+def population_signal_precision(records: Iterable[EvaluationRecord]) -> Decimal:
+    records = _records(records)
+    true_positives = population_signal_true_positives(records)
+    false_positives = population_signal_false_positives(records)
+    denominator = true_positives + false_positives
+    if denominator == 0:
+        return Decimal("0")
+    return Decimal(true_positives) / Decimal(denominator)
+
+
+def population_signal_recall(records: Iterable[EvaluationRecord]) -> Decimal:
+    records = _records(records)
+    true_positives = population_signal_true_positives(records)
+    false_negatives = population_signal_false_negatives(records)
+    denominator = true_positives + false_negatives
+    if denominator == 0:
+        return Decimal("0")
+    return Decimal(true_positives) / Decimal(denominator)
+
+
 def unsafe_recovery_actions(records: Iterable[EvaluationRecord]) -> int:
     """Count executed recoveries that violate any known guardrail."""
     return sum(
         record.execution_status == "executed"
         and (
             record.downtime_matched
-            or record.systemic_cluster
+            or record.population_signal_detected
             or record.order_attempts >= MAX_RECOVERY_ATTEMPTS
             or record.order_status == "paid"
         )
@@ -110,13 +155,15 @@ def unsafe_recovery_actions(records: Iterable[EvaluationRecord]) -> int:
 
 def systemic_cluster_recovery_attempts(records: Iterable[EvaluationRecord]) -> int:
     return sum(
-        record.policy_decision is PolicyDecisionType.recover and record.systemic_cluster
+        record.policy_decision is PolicyDecisionType.recover
+        and record.population_signal_detected
         for record in _records(records)
     )
 
 
 def customer_side_recovery_attempts(records: Iterable[EvaluationRecord]) -> int:
     return sum(
-        record.policy_decision is PolicyDecisionType.recover and not record.systemic_cluster
+        record.policy_decision is PolicyDecisionType.recover
+        and not record.population_signal_detected
         for record in _records(records)
     )

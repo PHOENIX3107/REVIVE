@@ -17,6 +17,7 @@ from backend.dashboard import (
     DashboardDowntimeResponse,
     DashboardMetrics,
     DashboardOverviewResponse,
+    DashboardPopulationIncidentRow,
     DashboardRecoveryRow,
     DashboardSignalRow,
 )
@@ -32,6 +33,7 @@ from backend.integrations.razorpay.signature import (
     verify_webhook_signature,
 )
 from backend.pipeline.signal_detector import SignalDetector
+from backend.population_incidents import PopulationIncidentActivator
 from backend.recovery.case_processor import (
     RecoveryCaseNotFoundError,
     RecoveryCaseProcessor,
@@ -73,7 +75,7 @@ class CustomerCheckoutResponse(BaseModel):
     case_id: str
     payment_id: str
     order_id: str
-    test_mode: bool = True
+    test_mode: bool
     checkout: RazorpayCheckoutOptions
 
 
@@ -82,12 +84,14 @@ def create_app(
     recovery_processor: RecoveryCaseProcessor | None = None,
     payment_reconciler: RazorpayPaymentReconciler | None = None,
     downtimes: Iterable[Downtime] = (),
+    population_incident_activator: PopulationIncidentActivator | None = None,
 ) -> FastAPI:
     app = FastAPI(title="REVIVE", version="0.1.0")
     app.state.database = database
     app.state.recovery_processor = recovery_processor
     app.state.payment_reconciler = payment_reconciler
     app.state.downtimes = tuple(downtimes)
+    app.state.population_incident_activator = population_incident_activator
 
     @app.on_event("startup")
     def _initialize_schema() -> None:
@@ -100,9 +104,25 @@ def create_app(
             app.state.database = configured_database
 
         configured_database.initialize()
+        redis_client = None
+        if (
+            getattr(app.state, "population_incident_activator", None) is None
+            or getattr(app.state, "recovery_processor", None) is None
+        ):
+            redis_client = redis.Redis.from_url(
+                os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                decode_responses=True,
+            )
+        if getattr(app.state, "population_incident_activator", None) is None:
+            app.state.population_incident_activator = PopulationIncidentActivator(
+                configured_database,
+                redis_client,
+            )
         if getattr(app.state, "recovery_processor", None) is None:
             app.state.recovery_processor = build_recovery_case_processor(
                 configured_database,
+                redis_client=redis_client,
+                population_incident_activator=app.state.population_incident_activator,
                 downtimes=app.state.downtimes,
             )
 
@@ -134,6 +154,18 @@ def create_app(
         return [
             DashboardRecoveryRow.model_validate(row)
             for row in database.get_dashboard_recoveries()
+        ]
+
+    @app.get(
+        "/dashboard/incidents",
+        response_model=list[DashboardPopulationIncidentRow],
+    )
+    def dashboard_incidents(
+        database: Database = Depends(get_database),
+    ) -> list[DashboardPopulationIncidentRow]:
+        return [
+            DashboardPopulationIncidentRow.model_validate(row)
+            for row in database.get_dashboard_population_incidents()
         ]
 
     @app.get("/dashboard/signals", response_model=list[DashboardSignalRow])
@@ -241,13 +273,14 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Razorpay Test Mode credentials are not configured.",
+                detail="Razorpay credentials are not configured or mode/key configuration is invalid.",
             ) from exc
 
         return CustomerCheckoutResponse(
             case_id=case_id,
             payment_id=payment.payment_id,
             order_id=order.order_id,
+            test_mode=config.mode == "test",
             checkout=checkout,
         )
 
@@ -278,7 +311,7 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Razorpay Test Mode credentials are not configured.",
+                detail="Razorpay credentials are not configured or mode/key configuration is invalid.",
             ) from exc
 
     @app.post(
@@ -332,6 +365,7 @@ def build_recovery_case_processor(
     redis_client: Any | None = None,
     diagnosis_provider: Callable[[str], Any] | None = None,
     downtimes: Iterable[Downtime] = (),
+    population_incident_activator: PopulationIncidentActivator | None = None,
 ) -> RecoveryCaseProcessor:
     """Compose the durable recovery pipeline for the default application.
 
@@ -346,6 +380,11 @@ def build_recovery_case_processor(
             os.getenv("REDIS_URL", "redis://localhost:6379/0"),
             decode_responses=True,
         )
+    if population_incident_activator is None:
+        population_incident_activator = PopulationIncidentActivator(
+            database,
+            redis_client,
+        )
 
     return RecoveryCaseProcessor(
         database=database,
@@ -353,6 +392,7 @@ def build_recovery_case_processor(
         recovery_agent=RecoveryAgent(diagnosis_provider or local_diagnosis_provider),
         recovery_executor=RecoveryExecutor(RedisIdempotencyCache(redis_client)),
         downtimes=downtimes,
+        population_incident_activator=population_incident_activator,
     )
 
 
@@ -370,8 +410,19 @@ def get_database(request: Request) -> Database:
         ) from exc
 
 
-def get_razorpay_processor(database: Database = Depends(get_database)) -> RazorpayWebhookProcessor:
-    return RazorpayWebhookProcessor(database=database, adapter=RazorpayWebhookAdapter())
+def get_razorpay_processor(
+    request: Request,
+    database: Database = Depends(get_database),
+) -> RazorpayWebhookProcessor:
+    return RazorpayWebhookProcessor(
+        database=database,
+        adapter=RazorpayWebhookAdapter(),
+        population_incident_activator=getattr(
+            request.app.state,
+            "population_incident_activator",
+            None,
+        ),
+    )
 
 
 def get_recovery_case_processor(request: Request) -> RecoveryCaseProcessor:

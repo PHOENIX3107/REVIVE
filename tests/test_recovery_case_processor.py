@@ -43,6 +43,10 @@ class FakeRedis:
     def zcard(self, key):
         return len(self.sorted_sets.get(key, {}))
 
+    def zcount(self, key, minimum, maximum):
+        minimum = float(minimum)
+        return sum(score >= minimum for score in self.sorted_sets.get(key, {}).values())
+
     def expire(self, key, seconds):
         return True
 

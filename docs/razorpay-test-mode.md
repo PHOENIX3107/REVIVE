@@ -14,16 +14,19 @@ export POSTGRES_PASSWORD="replace_with_local_password"
 export POSTGRES_DB="revive"
 export DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:5432/${POSTGRES_DB}"
 export REDIS_URL="redis://localhost:6379/0"
+export RAZORPAY_MODE="test"
 export RAZORPAY_KEY_ID="rzp_test_..."
 export RAZORPAY_KEY_SECRET="..."
 export RAZORPAY_WEBHOOK_SECRET="..."
 ```
 
-The application rejects key IDs that are not prefixed with `rzp_test_`. Never
-put a key or secret in source control.
+Test mode requires a key ID prefixed with `rzp_test_`. Live mode is available
+only when explicitly selected with `RAZORPAY_MODE=live` and a matching
+`rzp_live_...` key. Never put a key or secret in source control, logs, or API
+responses. Rotate any credential that may have been exposed previously.
 
 `RAZORPAY_WEBHOOK_SECRET` is optional for the polling path. The reconciliation
-worker uses only `DATABASE_URL`, `RAZORPAY_KEY_ID`, and
+worker uses only `DATABASE_URL`, `RAZORPAY_MODE`, `RAZORPAY_KEY_ID`, and
 `RAZORPAY_KEY_SECRET`.
 
 Start the local dependencies and the API:

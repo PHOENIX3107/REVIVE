@@ -47,6 +47,19 @@ class RedisFailureCache:
         self.redis.expire(key, self.window_seconds)
         return count
 
+    def count_failures(
+        self,
+        issuer_bin: str,
+        error_code: str,
+        *,
+        occurred_at: datetime | None = None,
+    ) -> int:
+        """Count observed unique failures without changing the Redis set."""
+        occurred_at = occurred_at or datetime.now(timezone.utc)
+        cutoff = occurred_at.timestamp() - self.window_seconds
+        key = f"{self.key_prefix}:{issuer_bin}:{error_code}"
+        return int(self.redis.zcount(key, cutoff, "+inf"))
+
 
 class RedisIdempotencyCache:
     """Atomically claim recovery requests for the existing 24-hour window."""

@@ -11,6 +11,8 @@ from pydantic import BaseModel
 DEFAULT_BASE_URL = "https://api.razorpay.com/v1/"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 TEST_KEY_PREFIX = "rzp_test_"
+LIVE_KEY_PREFIX = "rzp_live_"
+RAZORPAY_MODES = frozenset({"test", "live"})
 
 
 @dataclass(frozen=True)
@@ -18,20 +20,26 @@ class RazorpayClientConfig:
     key_id: str
     key_secret: str
     base_url: str = DEFAULT_BASE_URL
+    mode: str = "test"
 
     def __post_init__(self) -> None:
-        if not isinstance(self.key_id, str) or not self.key_id.startswith(TEST_KEY_PREFIX):
-            raise ValueError("Only Razorpay Test Mode key IDs are supported.")
+        if self.mode not in RAZORPAY_MODES:
+            raise ValueError("RAZORPAY_MODE must be either 'test' or 'live'.")
+        expected_prefix = TEST_KEY_PREFIX if self.mode == "test" else LIVE_KEY_PREFIX
+        if not isinstance(self.key_id, str) or not self.key_id.startswith(expected_prefix):
+            mode_label = "Test Mode" if self.mode == "test" else "Live Mode"
+            raise ValueError(f"{mode_label} key IDs must start with {expected_prefix}.")
 
     @classmethod
     def from_env(cls) -> "RazorpayClientConfig":
         key_id = os.getenv("RAZORPAY_KEY_ID")
         key_secret = os.getenv("RAZORPAY_KEY_SECRET")
+        mode = os.getenv("RAZORPAY_MODE", "test").strip().lower()
         if not key_id or not key_secret:
             raise ValueError(
                 "RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET must be configured."
             )
-        return cls(key_id=key_id, key_secret=key_secret)
+        return cls(key_id=key_id, key_secret=key_secret, mode=mode)
 
 
 class RazorpayAPIError(RuntimeError):
@@ -43,7 +51,7 @@ class RazorpayAPIError(RuntimeError):
 
 
 class RazorpayCheckoutOptions(BaseModel):
-    """Client-side Checkout options for an existing Razorpay Test order."""
+    """Client-side Checkout options for an existing Razorpay order."""
 
     key: str
     order_id: str
@@ -58,7 +66,7 @@ def build_checkout_options(
     amount: int,
     currency: str,
 ) -> RazorpayCheckoutOptions:
-    """Build Checkout options for an existing Test Mode order."""
+    """Build Checkout options for an existing provider order."""
     if not order_id:
         raise ValueError("order_id is required for Checkout.")
     if not isinstance(amount, int) or amount <= 0:
@@ -74,7 +82,7 @@ def build_checkout_options(
 
 
 class RazorpayClient:
-    """Read-only client for the Razorpay Orders and Payments endpoints."""
+    """Read-only client for Razorpay Orders and Payments endpoints."""
 
     def __init__(
         self,

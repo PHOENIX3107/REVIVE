@@ -121,6 +121,25 @@ def test_client_config_rejects_non_test_mode_key(monkeypatch) -> None:
         RazorpayClientConfig.from_env()
 
 
+def test_client_config_requires_explicit_live_mode_for_live_key(monkeypatch) -> None:
+    monkeypatch.setenv("RAZORPAY_MODE", "live")
+    monkeypatch.setenv("RAZORPAY_KEY_ID", "rzp_live_key")
+    monkeypatch.setenv("RAZORPAY_KEY_SECRET", "secret")
+
+    config = RazorpayClientConfig.from_env()
+
+    assert config.mode == "live"
+
+
+def test_client_config_rejects_invalid_mode(monkeypatch) -> None:
+    monkeypatch.setenv("RAZORPAY_MODE", "production")
+    monkeypatch.setenv("RAZORPAY_KEY_ID", "rzp_test_key")
+    monkeypatch.setenv("RAZORPAY_KEY_SECRET", "secret")
+
+    with pytest.raises(ValueError, match="RAZORPAY_MODE"):
+        RazorpayClientConfig.from_env()
+
+
 def test_normalize_direct_api_payment_and_order_responses() -> None:
     payment = normalize_payment_response(
         {

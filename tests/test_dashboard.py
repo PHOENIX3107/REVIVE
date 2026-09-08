@@ -304,6 +304,64 @@ def test_dashboard_signals_group_only_failed_payments(client, database):
     )
 
 
+def test_dashboard_incidents_returns_only_current_active_incident_fields(client, database):
+    _save_order_and_payment(
+        database,
+        order_id="order_incident",
+        payment_id="pay_incident",
+        amount=1200,
+        order_status=OrderStatus.attempted,
+        payment_status=PaymentStatus.failed,
+        failed_at=NOW,
+        issuer_bin="453002",
+    )
+    activated_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=570)
+    with database.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO population_incidents
+                (incident_id, cohort_key, issuer_bin, error_code, status,
+                 threshold, window_seconds, observed_count_at_activation,
+                 trigger_payment_id, activated_at, last_qualifying_observed_at,
+                 expires_at)
+            VALUES (%s, %s, %s, 'issuer_declined', 'ACTIVE', 5, 600, 5,
+                    %s, %s, %s, %s)
+            """,
+            (
+                "incident_dashboard",
+                "population:v1:453002:issuer_declined",
+                "453002",
+                "pay_incident",
+                activated_at,
+                activated_at,
+                expires_at,
+            ),
+        )
+
+    response = client.get("/dashboard/incidents")
+
+    assert response.status_code == 200
+    row = response.json()[0]
+    assert row == {
+        "incident_id": "incident_dashboard",
+        "cohort_key": "population:v1:453002:issuer_declined",
+        "issuer_bin": "453002",
+        "error_code": "issuer_declined",
+        "status": "ACTIVE",
+        "threshold": 5,
+        "window_seconds": 600,
+        "observed_count_at_activation": 5,
+        "trigger_payment_id": "pay_incident",
+        "activated_at": row["activated_at"],
+        "last_qualifying_observed_at": row["last_qualifying_observed_at"],
+        "expires_at": row["expires_at"],
+    }
+    assert datetime.fromisoformat(row["activated_at"]) == activated_at
+    assert datetime.fromisoformat(row["last_qualifying_observed_at"]) == activated_at
+    assert datetime.fromisoformat(row["expires_at"]) == expires_at
+
+
 def test_dashboard_downtime_is_explicitly_unavailable(client):
     response = client.get("/dashboard/downtime")
 

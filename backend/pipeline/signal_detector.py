@@ -36,11 +36,16 @@ class SignalDetector:
                 window_seconds=self.window_seconds,
             )
 
-        count = self.failure_cache.record_failure(
+        self.failure_cache.record_failure(
             attempt.issuer_bin,
             attempt.error.code,
             occurred_at=attempt.failed_at,
             payment_id=attempt.payment_id,
+        )
+        count = self.failure_cache.count_failures(
+            attempt.issuer_bin,
+            attempt.error.code,
+            occurred_at=attempt.failed_at,
         )
         return SignalContext(
             is_cluster_candidate=count >= self.cluster_threshold,

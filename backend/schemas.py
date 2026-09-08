@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class OrderStatus(str, Enum):
@@ -71,3 +71,15 @@ class SignalContext(BaseModel):
     is_cluster_candidate: bool
     matching_failure_count: int
     window_seconds: int
+
+
+class PopulationIncidentContext(BaseModel):
+    """Immutable durable population-incident evidence for one case."""
+
+    model_config = ConfigDict(frozen=True)
+
+    population_incident_active: bool = False
+    population_incident_id: str | None = None
+    population_incident_activated_at: datetime | None = None
+    population_incident_expires_at: datetime | None = None
+    cohort_key: str | None = None
